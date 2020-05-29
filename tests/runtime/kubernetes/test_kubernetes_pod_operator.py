@@ -15,22 +15,26 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import json
-import os
-import shutil
 import unittest
+import pytest
 from tests.compat import mock
 
-import pytest
-from kubernetes.client.api_client import ApiClient
+import os
+import shutil
+import json
+from unittest.mock import ANY
+from subprocess import check_call
 from kubernetes.client.rest import ApiException
-
-from airflow import AirflowException
+import kubernetes.client.models as k8s
+from kubernetes.client.api_client import ApiClient
 from airflow.contrib.operators.kubernetes_pod_operator import KubernetesPodOperator
 from airflow.kubernetes.pod import Port
 from airflow.kubernetes.pod_launcher import PodLauncher
 from airflow.kubernetes.secret import Secret
-from airflow.kubernetes.volume import Volume
+from airflow import AirflowException
+from airflow.kubernetes.pod_launcher import PodLauncher
+from airflow.kubernetes.pod import Port
+from airflow.kubernetes.pod_generator import PodDefaults
 from airflow.kubernetes.volume_mount import VolumeMount
 from airflow.version import version as airflow_version
 
@@ -77,24 +81,6 @@ class TestKubernetesPodOperator(unittest.TestCase):
             }
         }
 
-    def test_do_xcom_push_defaults_false(self):
-        new_config_path = '/tmp/kube_config'
-        old_config_path = os.path.expanduser('~/.kube/config')
-        shutil.copy(old_config_path, new_config_path)
-
-        k = KubernetesPodOperator(
-            namespace='default',
-            image="ubuntu:16.04",
-            cmds=["bash", "-cx"],
-            arguments=["echo 10"],
-            labels={"foo": "bar"},
-            name="test",
-            task_id="task",
-            in_cluster=False,
-            do_xcom_push=False,
-            config_file=new_config_path,
-        )
-        self.assertFalse(k.do_xcom_push)
 
     def test_config_path_move(self):
         new_config_path = '/tmp/kube_config'
@@ -114,6 +100,8 @@ class TestKubernetesPodOperator(unittest.TestCase):
             config_file=new_config_path,
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.assertEqual(self.expected_pod, actual_pod)
 
     @mock.patch("airflow.kubernetes.pod_launcher.PodLauncher.run_pod")
     @mock.patch("airflow.kubernetes.kube_client.get_kube_client")
@@ -163,8 +151,10 @@ class TestKubernetesPodOperator(unittest.TestCase):
         )
         mock_launcher.return_value = (State.SUCCESS, None)
         k.execute(None)
-        self.assertEqual(mock_launcher.call_args[0][0].image_pull_secrets,
-                         fake_pull_secrets)
+        self.assertEqual(
+            mock_launcher.call_args[0][0].spec.image_pull_secrets,
+            [k8s.V1LocalObjectReference(name=fake_pull_secrets)]
+        )
 
     @mock.patch("airflow.kubernetes.pod_launcher.PodLauncher.run_pod")
     @mock.patch("airflow.kubernetes.pod_launcher.PodLauncher.delete_pod")
@@ -201,6 +191,8 @@ class TestKubernetesPodOperator(unittest.TestCase):
             do_xcom_push=False,
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.assertEqual(self.expected_pod, actual_pod)
 
     def test_delete_operator_pod(self):
         k = KubernetesPodOperator(
@@ -216,6 +208,8 @@ class TestKubernetesPodOperator(unittest.TestCase):
             do_xcom_push=False,
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.assertEqual(self.expected_pod, actual_pod)
 
     def test_pod_hostnetwork(self):
         k = KubernetesPodOperator(
@@ -231,6 +225,9 @@ class TestKubernetesPodOperator(unittest.TestCase):
             hostnetwork=True,
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.expected_pod['spec']['hostNetwork'] = True
+        self.assertEqual(self.expected_pod, actual_pod)
 
     def test_pod_dnspolicy(self):
         dns_policy = "ClusterFirstWithHostNet"
@@ -248,6 +245,10 @@ class TestKubernetesPodOperator(unittest.TestCase):
             dnspolicy=dns_policy,
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.expected_pod['spec']['hostNetwork'] = True
+        self.expected_pod['spec']['dnsPolicy'] = dns_policy
+        self.assertEqual(self.expected_pod, actual_pod)
 
     def test_pod_node_selectors(self):
         node_selectors = {
@@ -266,6 +267,9 @@ class TestKubernetesPodOperator(unittest.TestCase):
             node_selectors=node_selectors,
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.expected_pod['spec']['nodeSelector'] = node_selectors
+        self.assertEqual(self.expected_pod, actual_pod)
 
     def test_pod_resources(self):
         resources = {
@@ -287,6 +291,9 @@ class TestKubernetesPodOperator(unittest.TestCase):
             resources=resources,
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.expected_pod['spec']['containers'][0]['resources'] = resources
+        self.assertEqual(self.expected_pod, actual_pod)
 
     def test_pod_affinity(self):
         affinity = {
@@ -319,6 +326,9 @@ class TestKubernetesPodOperator(unittest.TestCase):
             affinity=affinity,
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.expected_pod['spec']['affinity'] = affinity
+        self.assertEqual(self.expected_pod, actual_pod)
 
     def test_port(self):
         port = Port('http', 80)
@@ -336,6 +346,12 @@ class TestKubernetesPodOperator(unittest.TestCase):
             ports=[port],
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.expected_pod['spec']['containers'][0]['ports'] = [{
+            'name': 'http',
+            'containerPort': 80
+        }]
+        self.assertEqual(self.expected_pod, actual_pod)
 
     def test_volume_mount(self):
         with mock.patch.object(PodLauncher, 'log') as mock_logger:
@@ -368,6 +384,20 @@ class TestKubernetesPodOperator(unittest.TestCase):
             )
             k.execute(None)
             mock_logger.info.assert_any_call(b"retrieved from mount\n")
+            actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+            self.expected_pod['spec']['containers'][0]['args'] = args
+            self.expected_pod['spec']['containers'][0]['volumeMounts'] = [{
+                'name': 'test-volume',
+                'mountPath': '/root/mount_file',
+                'readOnly': True
+            }]
+            self.expected_pod['spec']['volumes'] = [{
+                'name': 'test-volume',
+                'persistentVolumeClaim': {
+                    'claimName': 'test-volume'
+                }
+            }]
+            self.assertEqual(self.expected_pod, actual_pod)
 
     def test_run_as_user_root(self):
         security_context = {
@@ -388,6 +418,9 @@ class TestKubernetesPodOperator(unittest.TestCase):
             security_context=security_context,
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.expected_pod['spec']['securityContext'] = security_context
+        self.assertEqual(self.expected_pod, actual_pod)
 
     def test_run_as_user_non_root(self):
         security_context = {
@@ -409,6 +442,9 @@ class TestKubernetesPodOperator(unittest.TestCase):
             security_context=security_context,
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.expected_pod['spec']['securityContext'] = security_context
+        self.assertEqual(self.expected_pod, actual_pod)
 
     def test_fs_group(self):
         security_context = {
@@ -430,6 +466,9 @@ class TestKubernetesPodOperator(unittest.TestCase):
             security_context=security_context,
         )
         k.execute(None)
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        self.expected_pod['spec']['securityContext'] = security_context
+        self.assertEqual(self.expected_pod, actual_pod)
 
     def test_faulty_image(self):
         bad_image_name = "foobar"
@@ -447,6 +486,9 @@ class TestKubernetesPodOperator(unittest.TestCase):
         )
         with self.assertRaises(AirflowException):
             k.execute(None)
+            actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+            self.expected_pod['spec']['containers'][0]['image'] = bad_image_name
+            self.assertEqual(self.expected_pod, actual_pod)
 
     def test_faulty_service_account(self):
         bad_service_account_name = "foobar"
@@ -465,6 +507,9 @@ class TestKubernetesPodOperator(unittest.TestCase):
         )
         with self.assertRaises(ApiException):
             k.execute(None)
+            actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+            self.expected_pod['spec']['serviceAccountName'] = bad_service_account_name
+            self.assertEqual(self.expected_pod, actual_pod)
 
     def test_pod_failure(self):
         """
@@ -484,6 +529,9 @@ class TestKubernetesPodOperator(unittest.TestCase):
         )
         with self.assertRaises(AirflowException):
             k.execute(None)
+            actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+            self.expected_pod['spec']['containers'][0]['args'] = bad_internal_command
+            self.assertEqual(self.expected_pod, actual_pod)
 
     def test_xcom_push(self):
         return_value = '{"foo": "bar"\n, "buzz": 2}'
@@ -500,13 +548,23 @@ class TestKubernetesPodOperator(unittest.TestCase):
             do_xcom_push=True,
         )
         self.assertEqual(k.execute(None), json.loads(return_value))
+        actual_pod = self.api_client.sanitize_for_serialization(k.pod)
+        volume = self.api_client.sanitize_for_serialization(PodDefaults.VOLUME)
+        volume_mount = self.api_client.sanitize_for_serialization(PodDefaults.VOLUME_MOUNT)
+        container = self.api_client.sanitize_for_serialization(PodDefaults.SIDECAR_CONTAINER)
+        self.expected_pod['spec']['containers'][0]['args'] = args
+        self.expected_pod['spec']['containers'][0]['volumeMounts'].insert(0, volume_mount)
+        self.expected_pod['spec']['volumes'].insert(0, volume)
+        self.expected_pod['spec']['containers'].append(container)
+        self.assertEqual(self.expected_pod, actual_pod)
 
     @mock.patch("airflow.kubernetes.pod_launcher.PodLauncher.run_pod")
     @mock.patch("airflow.kubernetes.kube_client.get_kube_client")
     def test_envs_from_configmaps(self, mock_client, mock_launcher):
         # GIVEN
         from airflow.utils.state import State
-        configmaps = ['test-configmap']
+
+        configmap= 'test-configmap'
         # WHEN
         k = KubernetesPodOperator(
             namespace='default',
@@ -518,12 +576,17 @@ class TestKubernetesPodOperator(unittest.TestCase):
             task_id="task",
             in_cluster=False,
             do_xcom_push=False,
-            configmaps=configmaps
+            configmaps=[configmap]
         )
         # THEN
         mock_launcher.return_value = (State.SUCCESS, None)
         k.execute(None)
-        self.assertEqual(mock_launcher.call_args[0][0].configmaps, configmaps)
+        self.assertEqual(
+            mock_launcher.call_args[0][0].spec.containers[0].env_from,
+            [k8s.V1EnvFromSource(config_map_ref=k8s.V1ConfigMapEnvSource(
+                name=configmap
+            ))]
+        )
 
     @mock.patch("airflow.kubernetes.pod_launcher.PodLauncher.run_pod")
     @mock.patch("airflow.kubernetes.kube_client.get_kube_client")
@@ -548,7 +611,12 @@ class TestKubernetesPodOperator(unittest.TestCase):
         # THEN
         mock_launcher.return_value = (State.SUCCESS, None)
         k.execute(None)
-        self.assertEqual(mock_launcher.call_args[0][0].secrets, secrets)
+        self.assertEqual(
+            mock_launcher.call_args[0][0].spec.containers[0].env_from,
+            [k8s.V1EnvFromSource(secret_ref=k8s.V1SecretEnvSource(
+                name=secret_ref
+            ))]
+        )
 
 
 # pylint: enable=unused-argument
